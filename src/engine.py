@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -34,6 +35,8 @@ class Auction:
     settled: bool = False
     bids: List[Bid] = field(default_factory=list)
     frozen_gold: Dict[str, int] = field(default_factory=dict)  # bidder -> frozen amount
+    # 每个拍卖一把锁：同一拍卖的出价/结算串行化，不同拍卖之间仍可并发。
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
 
 class AuctionEngine:
@@ -62,51 +65,84 @@ class AuctionEngine:
         return True
 
     def place_bid(self, aid: str, bidder: str, amount: int, now: int) -> bool:
-        """出价。BUG：不原子检查当前最高价，先扣金再检查。"""
-        auc = self.auctions.get(aid)
-        if auc is None or auc.settled:
-            return False
-        if now >= auc.end_time:
-            return False
-        if bidder == auc.seller:
-            return False
-        # BUG：先扣金币，再检查价格
-        if self.gold.get(bidder, 0) < amount:
-            return False
-        self.gold[bidder] -= amount
-        # 冻结之前出价者的金币应该先返还
-        if auc.current_bidder and auc.current_bidder != bidder:
-            old = auc.current_bidder
-            self.gold[old] = self.gold.get(old, 0) + auc.frozen_gold.get(old, 0)
-            auc.frozen_gold.pop(old, None)
-        # BUG：不检查 amount > current_price，直接接受
-        auc.current_price = amount  # BUG：应该 if amount <= auc.current_price: return False 并返还金币
-        auc.current_bidder = bidder
-        auc.frozen_gold[bidder] = amount
-        auc.bids.append(Bid(bidder, amount, now))
-        return True
+        """出价：在拍卖锁内原子地检查最高价、扣金、记录出价、更新最高价。
 
-    def settle(self, aid: str, now: int) -> bool:
-        """结算拍卖。BUG：超时后不自动结算，需要手动调用且可能重复。"""
+        所有前置校验通过后才变更任何状态；任一校验失败直接拒绝，
+        不发生扣金，无需回滚。新出价必须严格大于当前最高价。
+        """
         auc = self.auctions.get(aid)
         if auc is None:
             return False
-        if now < auc.end_time:
+        with auc.lock:
+            if now >= auc.end_time:
+                # 拍卖已超时：自动结算（成交或流拍），拒绝新的出价。
+                self._settle_locked(auc)
+                return False
+            if auc.settled:
+                return False
+            if bidder == auc.seller:
+                return False
+            if amount <= auc.current_price:
+                # 必须严格大于当前最高价，否则拒绝（未扣金，无需返还）。
+                return False
+            already_frozen = auc.frozen_gold.get(bidder, 0)
+            needed = amount - already_frozen  # 自己加价时只需补差额
+            if self.gold.get(bidder, 0) < needed:
+                return False
+            # 前置校验全部通过，开始原子变更：扣金 -> 解冻旧最高出价 -> 记录 -> 更新最高价。
+            self.gold[bidder] -= needed
+            if auc.current_bidder and auc.current_bidder != bidder:
+                old = auc.current_bidder
+                self.gold[old] = self.gold.get(old, 0) + auc.frozen_gold.pop(old, 0)
+            auc.current_price = amount
+            auc.current_bidder = bidder
+            auc.frozen_gold[bidder] = amount
+            auc.bids.append(Bid(bidder, amount, now))
+            self.trade_log.append(f"{aid} bid {amount} by {bidder}")
+            return True
+
+    def settle(self, aid: str, now: int) -> bool:
+        """结算拍卖：超时后成交（最高价者得）或流拍（物品返还卖家）。
+
+        幂等：已结算的拍卖重复结算直接返回 False，不会重复成交/发奖。
+        """
+        auc = self.auctions.get(aid)
+        if auc is None:
             return False
-        # BUG：不检查 settled，可能重复结算
+        with auc.lock:
+            if auc.settled:
+                return False
+            if now < auc.end_time:
+                return False
+            self._settle_locked(auc)
+            return True
+
+    def settle_expired(self, now: int) -> List[str]:
+        """自动结算所有已到期的拍卖，返回本次结算的拍卖 id 列表。"""
+        settled = []
+        for aid in list(self.auctions):
+            auc = self.auctions[aid]
+            if not auc.settled and now >= auc.end_time:
+                if self.settle(aid, now):
+                    settled.append(aid)
+        return settled
+
+    def _settle_locked(self, auc: Auction) -> None:
+        """在持有 auc.lock 的前提下执行结算。调用前需检查未 settled。"""
+        if auc.settled:
+            return
         if auc.current_bidder:
-            # 成交
+            # 成交：卖家收到冻结的金币，买家获得物品。
             buyer = auc.current_bidder
-            self.gold[auc.seller] += auc.frozen_gold.get(buyer, auc.current_price)
-            auc.frozen_gold.pop(buyer, None)
-            self.inventory[buyer].append(auc.item)
-            self.trade_log.append(f"{aid} sold to {buyer} for {auc.current_price}")
+            self.gold[auc.seller] = self.gold.get(auc.seller, 0) \
+                + auc.frozen_gold.pop(buyer, auc.current_price)
+            self.inventory.setdefault(buyer, []).append(auc.item)
+            self.trade_log.append(f"{auc.aid} sold to {buyer} for {auc.current_price}")
         else:
-            # 流拍
-            self.inventory[auc.seller].append(auc.item)
-            self.trade_log.append(f"{aid} unsold, returned to {auc.seller}")
+            # 流拍：物品返还卖家。
+            self.inventory.setdefault(auc.seller, []).append(auc.item)
+            self.trade_log.append(f"{auc.aid} unsold, returned to {auc.seller}")
         auc.settled = True
-        return True
 
     def get_gold(self, pid: str) -> int:
         return self.gold.get(pid, 0)
